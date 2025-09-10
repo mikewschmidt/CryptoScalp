@@ -4,6 +4,12 @@ Trying to train a deep learning model to predict prices in a short time frame
 
 # Instructions for Running the Project
 
+## Step 0: Clone this repository
+
+```bash
+git clone https://github.com/mikewschmidt/CryptoScalp.git
+```
+
 ## Step 1: Install Dependencies
 
 Before running the main script, you need to install the required packages listed in `requirements.txt`. Open your terminal and navigate to the project directory, then run:
