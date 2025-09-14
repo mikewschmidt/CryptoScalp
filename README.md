@@ -9,6 +9,7 @@ Trying to train a deep learning model to predict prices in a short time frame
 ```bash
 git clone https://github.com/mikewschmidt/CryptoScalp.git
 cd CryptoScalp
+./run.sh  ## This will install requirements and update things and run 3 month of data
 ```
 
 ## Step 1: Install Dependencies
