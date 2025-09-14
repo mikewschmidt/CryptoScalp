@@ -1,0 +1,1307 @@
+#!/usr/bin/env python3
+#####
+#####  VERSION 0.1.2
+#####
+#####
+"""
+Improved Cryptocurrency Short-term Price Prediction System
+=========================================================
+
+A fixed and improved system for cryptocurrency price prediction focusing on:
+- Predicting returns instead of raw prices
+- Preventing data leakage
+- Using simpler, more robust models
+- Better feature engineering
+
+Author: AI Assistant
+License: MIT
+"""
+
+import os
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from typing import Dict, List, Tuple, Optional, Any
+from datetime import datetime, timedelta
+import json
+import pickle
+from pathlib import Path
+
+# Data handling and preprocessing
+from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.model_selection import train_test_split, TimeSeriesSplit
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.impute import SimpleImputer
+from sklearn.feature_selection import SelectKBest, f_regression
+from sklearn.ensemble import RandomForestRegressor
+from scipy import stats
+
+# Deep learning frameworks
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+import torch.nn.functional as F
+
+# XGBoost for ensemble
+import xgboost as xgb
+
+# Data source
+import ccxt
+
+# Suppress warnings
+warnings.filterwarnings('ignore')
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
+
+class ImprovedConfig:
+    """Improved configuration class with realistic parameters."""
+    
+    def __init__(self):
+        # Data parameters
+        self.csv_file = None
+        self.timestamp_col = 'Timestamp'
+        self.required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+        self.target_col = 'Close'
+        
+        # FIXED: Much shorter prediction horizons (more realistic)
+        self.prediction_horizons = [1, 2, 3]  # 1, 2, 3 minutes only
+        
+        # FIXED: Shorter sequence length for crypto's high volatility
+        self.sequence_length = 20  # 20 minutes lookback
+        
+        # FIXED: Simpler model parameters to prevent overfitting
+        self.lstm_hidden_size = 32
+        self.lstm_num_layers = 1
+        self.dropout_rate = 0.3
+        
+        # Training parameters
+        self.batch_size = 64
+        self.epochs = 100
+        self.learning_rate = 0.0005  # Lower learning rate
+        
+        # FIXED: Better data splits with more validation data
+        self.train_ratio = 0.6
+        self.val_ratio = 0.2
+        self.test_ratio = 0.2
+        
+        # Device
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Start with fewer models
+        self.models_to_train = {
+            'SimpleLSTM': True,
+            'BaselineModel': True,  # Always include baseline
+            'XGBoost': False,  # Can enable later
+        }
+        
+        # Output directory
+        self.output_dir = 'improved_crypto_results'
+
+
+class ImprovedDataLoader:
+    """Improved data loader with better preprocessing and feature engineering."""
+    
+    def __init__(self, config: ImprovedConfig):
+        self.config = config
+        self.scaler = RobustScaler()  # More robust to outliers
+        self.feature_selector = None
+        self.data = None
+        self.features = None
+        self.targets = {}
+        
+    def fetch_crypto_data(self, symbol='BTC/USD', timeframe='1m', limit=1000):
+        """Fetch real cryptocurrency data using CCXT."""
+        print(f"Fetching {symbol} data from Coinbase...")
+        
+        try:
+            exchange = ccxt.coinbase()
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+            
+            df = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+            df['Timestamp'] = pd.to_datetime(df['Timestamp'], unit='ms')
+            
+            print(f"Successfully fetched {len(df)} candles")
+            return df
+            
+        except Exception as e:
+            print(f"Error fetching data: {e}")
+            return None
+    
+    def check_data_quality(self):
+        """Check for data quality issues."""
+        print("Checking data quality...")
+        
+        # Check for duplicate timestamps
+        duplicates = self.data[self.config.timestamp_col].duplicated().sum()
+        print(f"Duplicate timestamps: {duplicates}")
+        if duplicates > 0:
+            self.data = self.data.drop_duplicates(subset=[self.config.timestamp_col])
+            print("Removed duplicate timestamps")
+        
+        # Check for missing values
+        missing = self.data[self.config.required_cols].isnull().sum()
+        print(f"Missing values per column:\n{missing}")
+        
+        # Check for extreme outliers (>20% price changes)
+        price_changes = self.data['Close'].pct_change()
+        extreme_changes = (abs(price_changes) > 0.2).sum()
+        print(f"Extreme price changes (>20%): {extreme_changes}")
+        
+        # Remove extreme outliers
+        if extreme_changes > 0:
+            valid_changes = abs(price_changes) <= 0.2
+            self.data = self.data[valid_changes | price_changes.isna()].reset_index(drop=True)
+            print(f"Removed {extreme_changes} extreme outliers")
+        
+        return True
+    
+    def load_data(self, csv_file: Optional[str] = None) -> pd.DataFrame:
+        """Load and validate data."""
+        if csv_file and os.path.exists(csv_file):
+            print(f"Loading data from {csv_file}")
+            self.data = pd.read_csv(csv_file)
+            self.data[self.config.timestamp_col] = pd.to_datetime(self.data[self.config.timestamp_col])
+        else:
+            print("No CSV file provided or file not found. Fetching live data...")
+            self.data = self.fetch_crypto_data()
+            
+            if self.data is None:
+                raise ValueError("Could not load or fetch data")
+        
+        # Ensure required columns exist
+        missing_cols = [col for col in self.config.required_cols if col not in self.data.columns]
+        if missing_cols:
+            raise ValueError(f"Missing required columns: {missing_cols}")
+        
+        # Sort by timestamp and reset index
+        self.data = self.data.sort_values(self.config.timestamp_col).reset_index(drop=True)
+        
+        # Check data quality
+        self.check_data_quality()
+        
+        print(f"Final data shape: {self.data.shape}")
+        print(f"Date range: {self.data[self.config.timestamp_col].min()} to {self.data[self.config.timestamp_col].max()}")
+        
+        return self.data
+    
+    def engineer_features(self) -> pd.DataFrame:
+        """FIXED: Improved feature engineering without data leakage."""
+        print("Engineering features...")
+        
+        df = self.data.copy()
+        
+        # CRITICAL FIX: Calculate returns instead of using raw prices
+        df['Returns'] = df['Close'].pct_change()
+        df['Log_Returns'] = np.log(df['Close'] / df['Close'].shift(1))
+        
+        # Volatility features (very important for crypto)
+        df['Volatility_5'] = df['Returns'].rolling(5).std()
+        df['Volatility_20'] = df['Returns'].rolling(20).std()
+        df['Volatility_Ratio'] = df['Volatility_5'] / df['Volatility_20']
+        
+        # Volume-price features
+        df['Volume_MA'] = df['Volume'].rolling(20).mean()
+        df['Volume_Ratio'] = df['Volume'] / df['Volume_MA']
+        df['Volume_Price_Trend'] = df['Volume'] * df['Returns']
+        
+        # Price position features
+        df['Price_Position'] = (df['Close'] - df['Low']) / (df['High'] - df['Low'])
+        df['Spread_Ratio'] = (df['High'] - df['Low']) / df['Close']
+        
+        # Momentum features
+        for period in [5, 10, 20]:
+            df[f'Momentum_{period}'] = df['Close'] / df['Close'].shift(period) - 1
+            df[f'SMA_{period}'] = df['Close'].rolling(period).mean()
+            df[f'Price_to_SMA_{period}'] = df['Close'] / df[f'SMA_{period}'] - 1
+        
+        # RSI (Relative Strength Index)
+        delta = df['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['RSI'] = 100 - (100 / (1 + rs))
+        df['RSI_Normalized'] = (df['RSI'] - 50) / 50  # Normalize RSI
+        
+        # Lagged features (very important for time series)
+        for lag in [1, 2, 3, 5]:
+            df[f'Returns_Lag_{lag}'] = df['Returns'].shift(lag)
+            df[f'Volume_Lag_{lag}'] = np.log(df['Volume']).shift(lag)  # Log transform volume
+        
+        # Order book proxy features
+        df['Upper_Shadow'] = (df['High'] - df[['Open', 'Close']].max(axis=1)) / df['Close']
+        df['Lower_Shadow'] = (df[['Open', 'Close']].min(axis=1) - df['Low']) / df['Close']
+        df['Body_Size'] = abs(df['Close'] - df['Open']) / df['Close']
+        
+        # Time-based features (careful not to leak information)
+        df['Hour'] = df[self.config.timestamp_col].dt.hour
+        df['DayOfWeek'] = df[self.config.timestamp_col].dt.dayofweek
+        df['IsWeekend'] = (df['DayOfWeek'] >= 5).astype(int)
+        
+        # CRITICAL: Remove any rows with NaN values
+        initial_rows = len(df)
+        df = df.dropna().reset_index(drop=True)
+        removed_rows = initial_rows - len(df)
+        print(f"Removed {removed_rows} rows with NaN values")
+        
+        # Select only engineered features (not raw OHLCV)
+        feature_cols = [col for col in df.columns 
+                       if col not in [self.config.timestamp_col, 'Open', 'High', 'Low', 'Close', 'Volume']
+                       and not col.startswith('SMA_')]  # Remove intermediate calculations
+        
+        self.features = df[feature_cols].copy()
+        self.data = df
+        
+        print(f"Feature engineering complete. Features: {len(feature_cols)}, Rows: {len(df)}")
+        print(f"Feature list: {feature_cols}")
+        
+        return df
+    
+    def create_targets(self) -> Dict[int, np.ndarray]:
+        """FIXED: Create percentage return targets instead of raw prices."""
+        print("Creating target variables (percentage returns)...")
+        
+        targets = {}
+        current_price = self.data[self.config.target_col]
+        
+        for horizon in self.config.prediction_horizons:
+            future_price = current_price.shift(-horizon)
+            
+            # CRITICAL FIX: Predict percentage returns instead of raw prices
+            price_returns = (future_price - current_price) / current_price
+            targets[horizon] = price_returns.values
+            
+            print(f"Horizon {horizon}min: mean return = {np.nanmean(price_returns):.6f}, "
+                  f"std = {np.nanstd(price_returns):.6f}")
+        
+        # Remove rows without valid targets
+        max_horizon = max(self.config.prediction_horizons)
+        for horizon in targets:
+            targets[horizon] = targets[horizon][:-max_horizon]
+        
+        # Update features to match target length
+        self.features = self.features.iloc[:-max_horizon].copy()
+        
+        self.targets = targets
+        print(f"Targets created for horizons: {list(targets.keys())}")
+        
+        return targets
+    
+    def feature_selection(self, X: np.ndarray, y: np.ndarray, k: int = 20):
+        """Select the most predictive features."""
+        print(f"Selecting top {k} features...")
+        
+        # Remove features with zero variance first
+        non_zero_var = X.var(axis=0) > 1e-6
+        X_filtered = X[:, non_zero_var]
+        
+        if X_filtered.shape[1] == 0:
+            raise ValueError("No features with non-zero variance")
+        
+        # Update k to not exceed available features
+        k = min(k, X_filtered.shape[1])
+        
+        # Select best features using F-statistic
+        selector = SelectKBest(score_func=f_regression, k=k)
+        X_selected = selector.fit_transform(X_filtered, y)
+        
+        # Store the complete transformation pipeline
+        self.non_zero_var_mask = non_zero_var
+        self.feature_selector = selector
+        
+        # Get selected feature names
+        feature_names_filtered = [name for i, name in enumerate(self.features.columns) if non_zero_var[i]]
+        selected_mask = selector.get_support()
+        selected_features = [feature_names_filtered[i] for i, selected in enumerate(selected_mask) if selected]
+        
+        print(f"Selected features: {selected_features}")
+        self.selected_feature_names = selected_features
+        
+        return X_selected, selected_features
+    
+    def apply_feature_selection(self, X: np.ndarray):
+        """Apply the fitted feature selection to new data."""
+        if self.feature_selector is None:
+            raise ValueError("Feature selector not fitted. Call feature_selection first.")
+        
+        # Apply the same transformations as during training
+        X_filtered = X[:, self.non_zero_var_mask]
+        X_selected = self.feature_selector.transform(X_filtered)
+        
+        return X_selected
+    
+    def prepare_sequences(self, features: np.ndarray, targets: np.ndarray, 
+                         sequence_length: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Prepare sequential data for time series models."""
+        X, y = [], []
+        
+        for i in range(sequence_length, len(features)):
+            X.append(features[i-sequence_length:i])
+            y.append(targets[i])
+        
+        return np.array(X), np.array(y)
+    
+    def split_data(self, horizon: int) -> Dict[str, Any]:
+        """FIXED: Proper time series split with consistent feature selection."""
+        print(f"Splitting data for {horizon}-minute horizon...")
+        
+        # Get targets and remove NaN values
+        targets = self.targets[horizon]
+        valid_indices = ~np.isnan(targets)
+        
+        features_clean = self.features[valid_indices].values
+        targets_clean = targets[valid_indices]
+        
+        print(f"Clean data shape: {features_clean.shape}, targets: {len(targets_clean)}")
+        
+        # Time series split first
+        n_samples = len(features_clean)
+        train_end = int(n_samples * self.config.train_ratio)
+        val_end = int(n_samples * (self.config.train_ratio + self.config.val_ratio))
+        
+        # Split the data
+        X_train_raw = features_clean[:train_end]
+        y_train_clean = targets_clean[:train_end]
+        X_val_raw = features_clean[train_end:val_end]
+        y_val_clean = targets_clean[train_end:val_end]
+        X_test_raw = features_clean[val_end:]
+        y_test_clean = targets_clean[val_end:]
+        
+        # Remove any remaining NaN values from training data
+        train_valid = ~(np.isnan(X_train_raw).any(axis=1) | np.isnan(y_train_clean))
+        X_train_for_selection = X_train_raw[train_valid]
+        y_train_for_selection = y_train_clean[train_valid]
+        
+        print(f"Training data for feature selection: {X_train_for_selection.shape}")
+        
+        # Perform feature selection on training data only
+        X_train_selected, selected_features = self.feature_selection(
+            X_train_for_selection, y_train_for_selection, k=15
+        )
+        
+        # Apply feature selection to all data splits
+        X_train_selected_full = self.apply_feature_selection(X_train_raw)
+        X_val_selected = self.apply_feature_selection(X_val_raw)
+        X_test_selected = self.apply_feature_selection(X_test_raw)
+        
+        # Scale features using training data statistics
+        self.scaler.fit(X_train_selected_full)
+        X_train_scaled = self.scaler.transform(X_train_selected_full)
+        X_val_scaled = self.scaler.transform(X_val_selected)
+        X_test_scaled = self.scaler.transform(X_test_selected)
+        
+        # Create sequences for LSTM models
+        X_train_seq, y_train_seq = self.prepare_sequences(X_train_scaled, y_train_clean, self.config.sequence_length)
+        X_val_seq, y_val_seq = self.prepare_sequences(X_val_scaled, y_val_clean, self.config.sequence_length)
+        X_test_seq, y_test_seq = self.prepare_sequences(X_test_scaled, y_test_clean, self.config.sequence_length)
+        
+        # For non-sequential models, use flat data (remove sequence requirement)
+        seq_len = self.config.sequence_length
+        X_train_flat = X_train_scaled[seq_len:]
+        y_train_flat = y_train_clean[seq_len:]
+        X_val_flat = X_val_scaled[seq_len:]
+        y_val_flat = y_val_clean[seq_len:]
+        X_test_flat = X_test_scaled[seq_len:]
+        y_test_flat = y_test_clean[seq_len:]
+        
+        print(f"Final splits - Train: {len(X_train_seq)}, Val: {len(X_val_seq)}, Test: {len(X_test_seq)}")
+        print(f"Feature dimensions after selection and scaling: {X_train_scaled.shape[1]}")
+        
+        return {
+            'X_train': X_train_seq, 'y_train': y_train_seq,
+            'X_val': X_val_seq, 'y_val': y_val_seq,
+            'X_test': X_test_seq, 'y_test': y_test_seq,
+            'X_train_flat': X_train_flat, 'y_train_flat': y_train_flat,
+            'X_val_flat': X_val_flat, 'y_val_flat': y_val_flat,
+            'X_test_flat': X_test_flat, 'y_test_flat': y_test_flat,
+            'selected_features': selected_features
+        }
+
+
+class SimpleLSTM(nn.Module):
+    """FIXED: Simplified LSTM model to prevent overfitting."""
+    
+    def __init__(self, input_size: int, hidden_size: int = 32, dropout: float = 0.3):
+        super(SimpleLSTM, self).__init__()
+        self.hidden_size = hidden_size
+        
+        # Single LSTM layer
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=1, 
+                           batch_first=True, dropout=0.0)  # No dropout in single layer
+        
+        # Regularization layers
+        self.dropout = nn.Dropout(dropout)
+        self.batch_norm = nn.BatchNorm1d(hidden_size)
+        
+        # Output layer
+        self.fc = nn.Linear(hidden_size, 1)
+        
+        # Initialize weights
+        self.init_weights()
+        
+    def init_weights(self):
+        """Initialize weights for better convergence."""
+        for name, param in self.named_parameters():
+            if 'weight_ih' in name:
+                torch.nn.init.xavier_uniform_(param.data)
+            elif 'weight_hh' in name:
+                torch.nn.init.orthogonal_(param.data)
+            elif 'bias' in name:
+                param.data.fill_(0)
+    
+    def forward(self, x):
+        batch_size = x.size(0)
+        
+        # LSTM forward pass
+        lstm_out, _ = self.lstm(x)
+        
+        # Take last output
+        out = lstm_out[:, -1, :]
+        
+        # Apply batch normalization (only if batch size > 1)
+        if batch_size > 1:
+            out = self.batch_norm(out)
+        
+        # Apply dropout
+        out = self.dropout(out)
+        
+        # Final prediction
+        out = self.fc(out)
+        return out
+
+class BaselineModel:
+    """Simple baseline models for comparison."""
+    
+    def __init__(self):
+        self.last_value = 0
+        
+    def fit(self, X_train, y_train):
+        """Fit baseline model."""
+        # For random walk, we don't need to fit anything
+        pass
+    
+    def predict(self, X_test):
+        """Predict using simple baseline (predict no change)."""
+        # Handle different input types
+        if isinstance(X_test, (int, np.integer)):
+            # If it's just a length (number of samples)
+            n_samples = X_test
+        else:
+            # If it's an array-like object, get the number of samples
+            try:
+                # Try to get length first
+                n_samples = len(X_test)
+            except TypeError:
+                # If len() doesn't work, try to get shape
+                if hasattr(X_test, 'shape'):
+                    n_samples = X_test.shape[0]
+                else:
+                    # Last resort - assume it's a single prediction
+                    n_samples = 1
+        
+        # FIXED: Always return an array with the correct number of samples
+        # Baseline predicts no change (0% return) for all samples
+        return np.zeros(n_samples)
+    
+    def get_name(self):
+        return "Baseline_RandomWalk"
+    
+
+class ImprovedModelTrainer:
+    """FIXED: Improved model trainer with better regularization and validation."""
+    
+    def __init__(self, config: ImprovedConfig):
+        self.config = config
+        self.models = {}
+        self.results = {}
+        
+    def train_pytorch_model(self, model, train_loader, val_loader, horizon: int, model_name: str):
+        """FIXED: Improved training with better regularization and early stopping."""
+        print(f"Training {model_name} for {horizon}-minute horizon...")
+        
+        model = model.to(self.config.device)
+        
+        # Use SmoothL1Loss (more robust than MSE)
+        criterion = nn.SmoothL1Loss()
+        
+        # Adam optimizer with weight decay
+        optimizer = optim.Adam(model.parameters(), lr=self.config.learning_rate, weight_decay=1e-5)
+        
+        # Learning rate scheduler
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.7, patience=10, min_lr=1e-6
+        )
+        
+        best_val_loss = float('inf')
+        patience_counter = 0
+        train_losses = []
+        val_losses = []
+        
+        for epoch in range(self.config.epochs):
+            # Training phase
+            model.train()
+            train_loss = 0
+            train_batches = 0
+            
+            for batch_X, batch_y in train_loader:
+                batch_X = batch_X.to(self.config.device)
+                batch_y = batch_y.to(self.config.device)
+                
+                optimizer.zero_grad()
+                outputs = model(batch_X)
+                loss = criterion(outputs.squeeze(), batch_y)
+                
+                # Add L1 regularization
+                l1_reg = sum(param.abs().sum() for param in model.parameters())
+                loss = loss + 1e-6 * l1_reg
+                
+                loss.backward()
+                
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                optimizer.step()
+                train_loss += loss.item()
+                train_batches += 1
+            
+            # Validation phase
+            model.eval()
+            val_loss = 0
+            val_batches = 0
+            
+            with torch.no_grad():
+                for batch_X, batch_y in val_loader:
+                    batch_X = batch_X.to(self.config.device)
+                    batch_y = batch_y.to(self.config.device)
+                    outputs = model(batch_X)
+                    val_loss += criterion(outputs.squeeze(), batch_y).item()
+                    val_batches += 1
+            
+            # Calculate average losses
+            avg_train_loss = train_loss / train_batches if train_batches > 0 else float('inf')
+            avg_val_loss = val_loss / val_batches if val_batches > 0 else float('inf')
+            
+            train_losses.append(avg_train_loss)
+            val_losses.append(avg_val_loss)
+            
+            scheduler.step(avg_val_loss)
+            
+            # Early stopping and model saving
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                patience_counter = 0
+                torch.save(model.state_dict(), f'{model_name}_{horizon}min_best.pth')
+            else:
+                patience_counter += 1
+            
+            if epoch % 20 == 0:
+                print(f'Epoch {epoch}: Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}')
+            
+            # Early stopping
+            if patience_counter >= 25:
+                print(f"Early stopping triggered at epoch {epoch}")
+                break
+            
+            # Check for severe overfitting
+            if len(train_losses) > 30:
+                if val_losses[-1] > val_losses[-20] * 1.1:
+                    print("Severe overfitting detected, stopping training")
+                    break
+        
+        # Load best model
+        if os.path.exists(f'{model_name}_{horizon}min_best.pth'):
+            model.load_state_dict(torch.load(f'{model_name}_{horizon}min_best.pth'))
+        return model
+    
+    def train_xgboost_model(self, X_train, y_train, X_val, y_val, horizon: int):
+        """Train XGBoost model with proper regularization."""
+        print(f"Training XGBoost for {horizon}-minute horizon...")
+        
+        # Prepare data
+        dtrain = xgb.DMatrix(X_train, label=y_train)
+        dval = xgb.DMatrix(X_val, label=y_val)
+        
+        # Conservative parameters to prevent overfitting
+        params = {
+            'objective': 'reg:squarederror',
+            'eval_metric': 'rmse',
+            'max_depth': 4,  # Shallow trees
+            'learning_rate': 0.05,  # Low learning rate
+            'subsample': 0.7,
+            'colsample_bytree': 0.7,
+            'reg_alpha': 0.1,  # L1 regularization
+            'reg_lambda': 0.1,  # L2 regularization
+            'random_state': 42
+        }
+        
+        # Train model
+        model = xgb.train(
+            params, dtrain,
+            num_boost_round=200,
+            evals=[(dtrain, 'train'), (dval, 'val')],
+            early_stopping_rounds=20,
+            verbose_eval=False
+        )
+        
+        return model
+    
+    def evaluate_model(self, model, X_test, y_test, model_name: str, horizon: int, is_pytorch: bool = True):
+        """Evaluate model performance with multiple metrics."""
+        
+        # Handle BaselineModel specifically
+        if isinstance(model, BaselineModel) or model_name == 'Baseline':
+            predictions = model.predict(X_test)
+        elif is_pytorch:
+            model.eval()
+            with torch.no_grad():
+                if isinstance(X_test, np.ndarray):
+                    X_test_tensor = torch.FloatTensor(X_test).to(self.config.device)
+                else:
+                    X_test_tensor = X_test.to(self.config.device)
+                predictions = model(X_test_tensor).cpu().numpy().flatten()
+        elif hasattr(model, 'predict'):  # XGBoost or sklearn
+            if 'xgb' in str(type(model)).lower():
+                # XGBoost model
+                if isinstance(X_test, np.ndarray):
+                    dtest = xgb.DMatrix(X_test)
+                    predictions = model.predict(dtest)
+                else:
+                    predictions = model.predict(X_test)
+            else:
+                # Other sklearn-like models
+                predictions = model.predict(X_test)
+        else:
+            # Fallback - shouldn't happen with proper model types
+            raise ValueError(f"Unknown model type for {model_name}")
+        
+        # Ensure predictions is a 1D array with correct length
+        if isinstance(predictions, (int, float)):
+            # Single value - expand to match y_test length
+            predictions = np.full(len(y_test), predictions)
+        elif len(predictions.shape) > 1:
+            predictions = predictions.flatten()
+        
+        # Verify shapes match
+        if len(predictions) != len(y_test):
+            raise ValueError(f"Shape mismatch: predictions={len(predictions)}, y_test={len(y_test)}")
+        
+        # Calculate metrics
+        mae = mean_absolute_error(y_test, predictions)
+        rmse = np.sqrt(mean_squared_error(y_test, predictions))
+        r2 = r2_score(y_test, predictions)
+        
+        # Additional metrics for financial data
+        # Directional accuracy (did we predict the right direction?)
+        actual_direction = np.sign(y_test)
+        pred_direction = np.sign(predictions)
+        directional_accuracy = np.mean(actual_direction == pred_direction)
+        
+        return {
+            'MAE': mae,
+            'RMSE': rmse,
+            'R2': r2,
+            'Directional_Accuracy': directional_accuracy,
+            'predictions': predictions
+        }
+
+    
+    def create_baseline_predictions(self, y_test):
+        """Create baseline predictions for comparison."""
+        # Random walk baseline (predict no change)
+        return np.zeros_like(y_test)
+    
+    def train_all_models(self, data_loader: ImprovedDataLoader):
+        """Train all enabled models with proper evaluation."""
+        print("Starting model training with improved methodology...")
+        
+        os.makedirs(self.config.output_dir, exist_ok=True)
+        
+        for horizon in self.config.prediction_horizons:
+            print(f"\n{'='*60}")
+            print(f"Training models for {horizon}-minute horizon")
+            print(f"{'='*60}")
+            
+            # Get data splits
+            data_splits = data_loader.split_data(horizon)
+            
+            if len(data_splits['X_train']) < 50:
+                print(f"Not enough training data for {horizon}-minute horizon. Skipping.")
+                continue
+            
+            # Prepare PyTorch data loaders
+            if len(data_splits['X_train']) > 0:
+                X_train_tensor = torch.FloatTensor(data_splits['X_train'])
+                y_train_tensor = torch.FloatTensor(data_splits['y_train'])
+                train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+                train_loader = DataLoader(train_dataset, batch_size=self.config.batch_size, shuffle=True)
+                
+                X_val_tensor = torch.FloatTensor(data_splits['X_val'])
+                y_val_tensor = torch.FloatTensor(data_splits['y_val'])
+                val_dataset = TensorDataset(X_val_tensor, y_val_tensor)
+                val_loader = DataLoader(val_dataset, batch_size=self.config.batch_size, shuffle=False)
+            
+            input_size = data_splits['X_train'].shape[2] if len(data_splits['X_train'].shape) > 2 else data_splits['X_train'].shape[1]
+            horizon_results = {}
+            
+            # Initialize models dict for this horizon
+            if horizon not in self.models:
+                self.models[horizon] = {}
+            
+            
+            # Train Baseline Model (always include)
+            if self.config.models_to_train['BaselineModel']:
+                print("Training Baseline Model...")
+                baseline_model = BaselineModel()
+                baseline_model.fit(data_splits['X_train_flat'], data_splits['y_train_flat'])
+                
+                # Evaluate - FIXED: Pass is_pytorch=False for baseline
+                baseline_results = self.evaluate_model(
+                    baseline_model, data_splits['X_test_flat'], data_splits['y_test_flat'],
+                    'Baseline', horizon, is_pytorch=False
+                )
+                horizon_results['Baseline'] = baseline_results
+                self.models[horizon]['Baseline'] = baseline_model
+            
+            # Train Simple LSTM
+            if self.config.models_to_train['SimpleLSTM'] and len(data_splits['X_train']) > 0:
+                lstm_model = SimpleLSTM(
+                    input_size=input_size,
+                    hidden_size=self.config.lstm_hidden_size,
+                    dropout=self.config.dropout_rate
+                )
+                
+                lstm_model = self.train_pytorch_model(
+                    lstm_model, train_loader, val_loader, horizon, 'SimpleLSTM'
+                )
+                
+                # Evaluate
+                lstm_results = self.evaluate_model(
+                    lstm_model, data_splits['X_test'], data_splits['y_test'], 
+                    'SimpleLSTM', horizon
+                )
+                horizon_results['SimpleLSTM'] = lstm_results
+                self.models[horizon]['SimpleLSTM'] = lstm_model
+            
+            # Train XGBoost
+            if self.config.models_to_train['XGBoost']:
+                xgb_model = self.train_xgboost_model(
+                    data_splits['X_train_flat'], data_splits['y_train_flat'],
+                    data_splits['X_val_flat'], data_splits['y_val_flat'],
+                    horizon
+                )
+                
+                # Evaluate
+                xgb_results = self.evaluate_model(
+                    xgb_model, data_splits['X_test_flat'], data_splits['y_test_flat'],
+                    'XGBoost', horizon, is_pytorch=False
+                )
+                horizon_results['XGBoost'] = xgb_results
+                self.models[horizon]['XGBoost'] = xgb_model
+            
+            # Store results for this horizon
+            self.results[horizon] = horizon_results
+            
+            # Print results summary
+            print(f"\nResults for {horizon}-minute horizon:")
+            print("-" * 70)
+            print(f"{'Model':<15} {'MAE':<10} {'RMSE':<10} {'R²':<10} {'Dir_Acc':<12}")
+            print("-" * 70)
+            
+            for model_name, results in horizon_results.items():
+                print(f"{model_name:<15} {results['MAE']:<10.6f} {results['RMSE']:<10.6f} "
+                      f"{results['R2']:<10.4f} {results['Directional_Accuracy']:<12.4f}")
+        
+        return self.results
+
+
+class ImprovedResultsAnalyzer:
+    """Enhanced results analyzer with better visualizations."""
+    
+    def __init__(self, config: ImprovedConfig):
+        self.config = config
+        
+    def create_results_summary(self, results: Dict) -> pd.DataFrame:
+        """Create a comprehensive summary DataFrame."""
+        summary_data = []
+        
+        for horizon, horizon_results in results.items():
+            for model_name, metrics in horizon_results.items():
+                summary_data.append({
+                    'Horizon (min)': horizon,
+                    'Model': model_name,
+                    'MAE': metrics['MAE'],
+                    'RMSE': metrics['RMSE'],
+                    'R²': metrics['R2'],
+                    'Directional_Accuracy': metrics['Directional_Accuracy']
+                })
+        
+        return pd.DataFrame(summary_data)
+    
+    def plot_results_comparison(self, results: Dict, save_path: str = None):
+        """Create comprehensive comparison plots."""
+        summary_df = self.create_results_summary(results)
+        
+        if summary_df.empty:
+            print("No results to plot")
+            return
+        
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        fig.suptitle('Model Performance Comparison - Improved System', fontsize=16)
+        
+        # MAE comparison
+        try:
+            pivot_mae = summary_df.pivot(index='Horizon (min)', columns='Model', values='MAE')
+            pivot_mae.plot(kind='bar', ax=axes[0, 0])
+            axes[0, 0].set_title('Mean Absolute Error (MAE) - Lower is Better')
+            axes[0, 0].set_ylabel('MAE')
+            axes[0, 0].legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+            axes[0, 0].grid(True, alpha=0.3)
+        except Exception as e:
+            axes[0, 0].text(0.5, 0.5, f'Error plotting MAE: {e}', ha='center', va='center')
+        
+        # R² comparison
+        try:
+            pivot_r2 = summary_df.pivot(index='Horizon (min)', columns='Model', values='R²')
+            pivot_r2.plot(kind='bar', ax=axes[0, 1])
+            axes[0, 1].set_title('R-squared (R²) - Higher is Better')
+            axes[0, 1].set_ylabel('R²')
+            axes[0, 1].legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+            axes[0, 1].grid(True, alpha=0.3)
+        except Exception as e:
+            axes[0, 1].text(0.5, 0.5, f'Error plotting R²: {e}', ha='center', va='center')
+        
+        # Directional Accuracy comparison
+        try:
+            pivot_dir = summary_df.pivot(index='Horizon (min)', columns='Model', values='Directional_Accuracy')
+            pivot_dir.plot(kind='bar', ax=axes[1, 0])
+            axes[1, 0].set_title('Directional Accuracy - Higher is Better')
+            axes[1, 0].set_ylabel('Accuracy')
+            axes[1, 0].legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+            axes[1, 0].grid(True, alpha=0.3)
+        except Exception as e:
+            axes[1, 0].text(0.5, 0.5, f'Error plotting Directional Accuracy: {e}', ha='center', va='center')
+        
+        # Model ranking by R²
+        try:
+            best_models = summary_df.loc[summary_df.groupby('Horizon (min)')['R²'].idxmax()]
+            colors = plt.cm.Set3(np.linspace(0, 1, len(best_models)))
+            
+            bars = axes[1, 1].bar(best_models['Horizon (min)'], best_models['R²'], color=colors)
+            axes[1, 1].set_title('Best Model R² by Horizon')
+            axes[1, 1].set_xlabel('Horizon (minutes)')
+            axes[1, 1].set_ylabel('R²')
+            axes[1, 1].grid(True, alpha=0.3)
+            
+            # Add model names as labels
+            for i, (bar, model_name) in enumerate(zip(bars, best_models['Model'])):
+                height = bar.get_height()
+                axes[1, 1].text(bar.get_x() + bar.get_width()/2., height + 0.001,
+                               model_name, ha='center', va='bottom', rotation=45, fontsize=9)
+        except Exception as e:
+            axes[1, 1].text(0.5, 0.5, f'Error plotting best models: {e}', ha='center', va='center')
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"Comparison plot saved to {save_path}")
+        
+        plt.show()
+        
+        return summary_df
+    
+    def plot_prediction_analysis(self, results: Dict, horizon: int, save_path: str = None):
+        """Plot detailed prediction analysis for a specific horizon."""
+        if horizon not in results:
+            print(f"No results available for {horizon}-minute horizon")
+            return
+        
+        horizon_results = results[horizon]
+        n_models = len(horizon_results)
+        
+        if n_models == 0:
+            print("No models to analyze")
+            return
+        
+        # Create subplots
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+        axes = axes.flatten()
+        
+        for i, (model_name, model_results) in enumerate(horizon_results.items()):
+            if i >= 4:  # Only plot first 4 models
+                break
+            
+            predictions = model_results['predictions'][:200]  # Plot first 200 predictions
+            actual = np.arange(len(predictions))  # This should be actual values, but we'll use indices
+            
+            # Scatter plot of predictions
+            axes[i].scatter(range(len(predictions)), predictions, alpha=0.6, s=20)
+            axes[i].plot(range(len(predictions)), predictions, alpha=0.5, linewidth=1)
+            axes[i].set_title(f'{model_name} - {horizon}min\nR² = {model_results["R2"]:.4f}')
+            axes[i].set_xlabel('Time Step')
+            axes[i].set_ylabel('Predicted Return')
+            axes[i].grid(True, alpha=0.3)
+            axes[i].axhline(y=0, color='red', linestyle='--', alpha=0.7, linewidth=1)
+        
+        # Hide unused subplots
+        for i in range(n_models, 4):
+            axes[i].set_visible(False)
+        
+        plt.suptitle(f'Prediction Analysis for {horizon}-minute Horizon (First 200 predictions)', 
+                     fontsize=16)
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"Prediction analysis saved to {save_path}")
+        
+        plt.show()
+    
+    def plot_feature_importance(self, model, feature_names, model_name: str, save_path: str = None):
+        """Plot feature importance for tree-based models."""
+        try:
+            if hasattr(model, 'feature_importances_'):  # XGBoost, RandomForest
+                importances = model.feature_importances_
+            elif hasattr(model, 'get_score'):  # XGBoost alternative
+                importance_dict = model.get_score(importance_type='weight')
+                importances = [importance_dict.get(f'f{i}', 0) for i in range(len(feature_names))]
+            else:
+                print(f"Feature importance not available for {model_name}")
+                return
+            
+            # Create DataFrame and sort
+            feature_imp_df = pd.DataFrame({
+                'feature': feature_names,
+                'importance': importances
+            }).sort_values('importance', ascending=True)
+            
+            # Plot
+            plt.figure(figsize=(10, 8))
+            plt.barh(range(len(feature_imp_df)), feature_imp_df['importance'])
+            plt.yticks(range(len(feature_imp_df)), feature_imp_df['feature'])
+            plt.xlabel('Feature Importance')
+            plt.title(f'Feature Importance - {model_name}')
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            
+            if save_path:
+                plt.savefig(save_path, dpi=300, bbox_inches='tight')
+                print(f"Feature importance plot saved to {save_path}")
+            
+            plt.show()
+            
+        except Exception as e:
+            print(f"Error plotting feature importance: {e}")
+    
+    def save_results(self, results: Dict, models: Dict, data_loader: ImprovedDataLoader, save_dir: str):
+        """Save comprehensive results and models."""
+        os.makedirs(save_dir, exist_ok=True)
+        
+        try:
+            # Save results summary
+            summary_df = self.create_results_summary(results)
+            summary_df.to_csv(os.path.join(save_dir, 'results_summary.csv'), index=False)
+            
+            # Save detailed results
+            with open(os.path.join(save_dir, 'detailed_results.json'), 'w') as f:
+                json_results = {}
+                for horizon, horizon_results in results.items():
+                    json_results[str(horizon)] = {}
+                    for model_name, metrics in horizon_results.items():
+                        json_results[str(horizon)][model_name] = {
+                            'MAE': float(metrics['MAE']),
+                            'RMSE': float(metrics['RMSE']),
+                            'R2': float(metrics['R2']),
+                            'Directional_Accuracy': float(metrics['Directional_Accuracy']),
+                            'predictions_sample': metrics['predictions'][:50].tolist()  # Save sample
+                        }
+                json.dump(json_results, f, indent=2)
+            
+            # Save models
+            for horizon, horizon_models in models.items():
+                for model_name, model in horizon_models.items():
+                    try:
+                        if hasattr(model, 'state_dict'):  # PyTorch model
+                            torch.save(model.state_dict(), 
+                                     os.path.join(save_dir, f'{model_name}_{horizon}min.pth'))
+                        elif hasattr(model, 'save_model'):  # XGBoost model
+                            model.save_model(os.path.join(save_dir, f'{model_name}_{horizon}min.json'))
+                        else:  # Other models (like baseline)
+                            with open(os.path.join(save_dir, f'{model_name}_{horizon}min.pkl'), 'wb') as f:
+                                pickle.dump(model, f)
+                    except Exception as e:
+                        print(f"Error saving model {model_name}: {e}")
+            
+            # Save scalers and preprocessors
+            with open(os.path.join(save_dir, 'scaler.pkl'), 'wb') as f:
+                pickle.dump(data_loader.scaler, f)
+            
+            if data_loader.feature_selector:
+                with open(os.path.join(save_dir, 'feature_selector.pkl'), 'wb') as f:
+                    pickle.dump(data_loader.feature_selector, f)
+            
+            print(f"Results and models saved to {save_dir}")
+            
+        except Exception as e:
+            print(f"Error saving results: {e}")
+
+
+class ImprovedCryptoPredictionSystem:
+    """Main improved prediction system."""
+    
+    def __init__(self, csv_file: str = None):
+        self.config = ImprovedConfig()
+        if csv_file:
+            self.config.csv_file = csv_file
+        
+        self.data_loader = ImprovedDataLoader(self.config)
+        self.trainer = ImprovedModelTrainer(self.config)
+        self.analyzer = ImprovedResultsAnalyzer(self.config)
+    
+    def run_experiment(self, experiment_name: str = "improved_crypto_experiment"):
+        """Run the complete improved prediction experiment."""
+        print("=" * 80)
+        print("IMPROVED CRYPTOCURRENCY PRICE PREDICTION SYSTEM")
+        print("Predicting percentage returns with proper methodology")
+        print("=" * 80)
+        
+        try:
+            # Step 1: Load and prepare data
+            print("\n1. Loading and preparing data...")
+            self.data_loader.load_data(self.config.csv_file)
+            self.data_loader.engineer_features()
+            self.data_loader.create_targets()
+            
+            print(f"Final feature shape: {self.data_loader.features.shape}")
+            print(f"Features with good variance: {(self.data_loader.features.var() > 1e-6).sum()}")
+            
+            # Step 2: Train all models
+            print("\n2. Training models...")
+            results = self.trainer.train_all_models(self.data_loader)
+            
+            if not results:
+                print("No models were trained successfully.")
+                return None, None
+            
+            # Step 3: Analyze results
+            print("\n3. Analyzing results...")
+            
+            # Create output directory with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_dir = f"{self.config.output_dir}_{experiment_name}_{timestamp}"
+            
+            # Generate summary
+            summary_df = self.analyzer.create_results_summary(results)
+            print("\nFinal Results Summary:")
+            print("=" * 100)
+            print(summary_df.to_string(index=False, float_format='%.6f'))
+            
+            # Step 4: Create visualizations
+            print("\n4. Creating visualizations...")
+            
+            # Overall comparison
+            self.analyzer.plot_results_comparison(
+                results, 
+                save_path=os.path.join(output_dir, 'model_comparison.png') if output_dir else None
+            )
+            
+            # Prediction analysis for each horizon
+            for horizon in self.config.prediction_horizons:
+                if horizon in results:
+                    self.analyzer.plot_prediction_analysis(
+                        results, horizon,
+                        save_path=os.path.join(output_dir, f'predictions_{horizon}min.png') if output_dir else None
+                    )
+            
+            # Feature importance plots
+            for horizon in results:
+                if 'XGBoost' in self.trainer.models.get(horizon, {}):
+                    xgb_model = self.trainer.models[horizon]['XGBoost']
+                    if hasattr(self.data_loader, 'selected_feature_names'):
+                        self.analyzer.plot_feature_importance(
+                            xgb_model, self.data_loader.selected_feature_names,
+                            f'XGBoost_{horizon}min',
+                            save_path=os.path.join(output_dir, f'feature_importance_xgb_{horizon}min.png') if output_dir else None
+                        )
+            
+            # Step 5: Save results
+            print("\n5. Saving results...")
+            if output_dir:
+                self.analyzer.save_results(results, self.trainer.models, self.data_loader, output_dir)
+            
+            # Print insights
+            print("\n" + "="*80)
+            print("EXPERIMENT INSIGHTS:")
+            print("="*80)
+            
+            if not summary_df.empty:
+                # Best models by R²
+                print("\nBest Models by Horizon (based on R²):")
+                print("-" * 50)
+                best_models = summary_df.loc[summary_df.groupby('Horizon (min)')['R²'].idxmax()]
+                for _, row in best_models.iterrows():
+                    print(f"{row['Horizon (min)']}min: {row['Model']} "
+                          f"(R² = {row['R²']:.4f}, Dir_Acc = {row['Directional_Accuracy']:.4f})")
+                
+                # Performance interpretation
+                print(f"\nPerformance Interpretation:")
+                print("-" * 30)
+                max_r2 = summary_df['R²'].max()
+                if max_r2 > 0.01:
+                    print("✓ Good: Some models show predictive power (R² > 0.01)")
+                elif max_r2 > 0.005:
+                    print("◯ Fair: Modest predictive power (R² > 0.005)")
+                else:
+                    print("✗ Poor: Very low predictive power - crypto is very noisy")
+                
+                max_dir_acc = summary_df['Directional_Accuracy'].max()
+                if max_dir_acc > 0.52:
+                    print("✓ Good: Models can predict direction better than random")
+                elif max_dir_acc > 0.51:
+                    print("◯ Fair: Slight directional prediction ability")
+                else:
+                    print("✗ Poor: No meaningful directional prediction")
+            
+            print(f"\nExperiment completed! Results saved to: {output_dir}")
+            
+            return results, output_dir
+            
+        except Exception as e:
+            print(f"Error during experiment: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return None, None
+    
+    def predict_future(self, horizon: int, model_name: str = None) -> Dict:
+        """Make predictions for future time steps."""
+        if horizon not in self.trainer.models:
+            available_horizons = list(self.trainer.models.keys())
+            raise ValueError(f"No models trained for {horizon}-minute horizon. Available: {available_horizons}")
+        
+        available_models = list(self.trainer.models[horizon].keys())
+        
+        if model_name is None:
+            # Use the best available model (prefer non-baseline)
+            non_baseline_models = [m for m in available_models if m != 'Baseline']
+            model_name = non_baseline_models[0] if non_baseline_models else available_models[0]
+        elif model_name not in available_models:
+            raise ValueError(f"Model {model_name} not available. Available: {available_models}")
+        
+        model = self.trainer.models[horizon][model_name]
+        
+        # Get latest data for prediction
+        latest_features = self.data_loader.features.iloc[-self.config.sequence_length:].values
+        
+        # Apply same preprocessing as training
+        if self.data_loader.feature_selector:
+            latest_features_selected = self.data_loader.apply_feature_selection(latest_features)
+        else:
+            latest_features_selected = latest_features
+        
+        latest_features_scaled = self.data_loader.scaler.transform(latest_features_selected)
+        
+        if model_name == 'Baseline':
+            # Baseline model predicts no change
+            prediction = 0.0
+        elif hasattr(model, 'eval'):  # PyTorch model
+            model.eval()
+            with torch.no_grad():
+                X_tensor = torch.FloatTensor(latest_features_scaled).unsqueeze(0).to(self.config.device)
+                prediction = model(X_tensor).cpu().numpy().flatten()[0]
+        else:  # XGBoost or other
+            # For non-sequential models, use the last row only
+            latest_row = latest_features_scaled[-1:] if len(latest_features_scaled.shape) > 1 else latest_features_scaled.reshape(1, -1)
+            if hasattr(model, 'predict'):
+                if 'xgb' in str(type(model)).lower():
+                    dtest = xgb.DMatrix(latest_row)
+                    prediction = model.predict(dtest)[0]
+                else:
+                    prediction = model.predict(latest_row)[0]
+            else:
+                prediction = model.predict(latest_row)[0]
+        
+        # Get current price for conversion
+        current_price = self.data_loader.data[self.config.target_col].iloc[-1]
+        predicted_price = current_price * (1 + prediction)
+        
+        return {
+            'horizon_minutes': horizon,
+            'model_used': model_name,
+            'predicted_return': float(prediction),
+            'current_price': float(current_price),
+            'predicted_price': float(predicted_price),
+            'timestamp': datetime.now().isoformat()
+        }
+
+
+def main():
+    """Main function to run the improved cryptocurrency prediction system."""
+    
+    print("Initializing IMPROVED Cryptocurrency Prediction System...")
+    print("Key improvements:")
+    print("- Predicting percentage returns instead of raw prices")
+    print("- Proper feature engineering without data leakage")
+    print("- Simpler models to prevent overfitting")
+    print("- Better evaluation metrics")
+    print("- Baseline comparison")
+    
+    # Option 1: Use with your CSV file
+    csv_file = "./3_months_of_days_of_crypto_(1m).csv"  # Update this path
+    
+    if os.path.exists(csv_file):
+        system = ImprovedCryptoPredictionSystem(csv_file)
+        print(f"Using CSV file: {csv_file}")
+    else:
+        # Option 2: Use live data
+        system = ImprovedCryptoPredictionSystem()
+        print("CSV file not found. Will use live data from Coinbase.")
+    
+    # Configure which models to train
+    system.config.models_to_train = {
+        'SimpleLSTM': True,
+        'BaselineModel': True,  # Always include baseline
+        'XGBoost': True,  # Enable XGBoost
+    }
+    
+    # Run the experiment
+    results, output_dir = system.run_experiment("improved_bitcoin_prediction")
+    
+    if results:
+        print("\n" + "="*80)
+        print("EXPERIMENT COMPLETED SUCCESSFULLY!")
+        print("="*80)
+        
+        # Example of making future predictions
+        print("\nMaking sample predictions...")
+        try:
+            for horizon in system.config.prediction_horizons:
+                if horizon in results:
+                    prediction = system.predict_future(horizon)
+                    print(f"\nPrediction for {horizon} minutes ahead:")
+                    print(f"  Current price: ${prediction['current_price']:.2f}")
+                    print(f"  Predicted return: {prediction['predicted_return']:.4f} ({prediction['predicted_return']*100:.2f}%)")
+                    print(f"  Predicted price: ${prediction['predicted_price']:.2f}")
+                    print(f"  Model used: {prediction['model_used']}")
+        except Exception as e:
+            print(f"Prediction error: {e}")
+        
+        # Provide usage instructions
+        print(f"\n" + "="*80)
+        print("HOW TO USE THE RESULTS:")
+        print("="*80)
+        print(f"1. All results are saved in: {output_dir}")
+        print("2. Check 'results_summary.csv' for model performance comparison")
+        print("3. Look at the generated plots to understand model behavior")
+        print("4. R² > 0.01 is actually good for 1-minute crypto prediction")
+        print("5. Directional accuracy > 52% means the model beats random guessing")
+        print("6. Compare all models to the Baseline to ensure they add value")
+        
+    else:
+        print("Experiment failed. Check error messages above.")
+
+
+if __name__ == "__main__":
+    main()
+
