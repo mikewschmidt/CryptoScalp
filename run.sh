@@ -9,7 +9,7 @@ pip install -r requirements.txt
 
 pip install --upgrade torch torchvision torchaudio
 
-#python testGPU.py
+python testGPU.py
 
-python main.py
+#python main.py
 
