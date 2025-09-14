@@ -1,0 +1,319 @@
+# Critical Fixes for Your Cryptocurrency Prediction Program
+
+## 1. **MOST CRITICAL: Fix Data Leakage and Target Creation**
+
+Your current target creation has a fundamental flaw. You're predicting future prices directly, but you should predict **price changes** or **returns**:
+
+```python
+def create_targets(self) -> Dict[int, np.ndarray]:
+    """Create target variables for different prediction horizons."""
+    print("Creating target variables...")
+    
+    targets = {}
+    for horizon in self.config.prediction_horizons:
+        # FIXED: Predict percentage change instead of raw price
+        current_price = self.data[self.config.target_col]
+        future_price = self.data[self.config.target_col].shift(-horizon)
+        
+        # Calculate percentage change (more predictable than raw prices)
+        price_change = (future_price - current_price) / current_price
+        targets[horizon] = price_change.values
+        
+        # Alternative: Use log returns (even better for financial data)
+        # log_returns = np.log(future_price / current_price)
+        # targets[horizon] = log_returns.values
+    
+    # Remove rows with NaN targets
+    max_horizon = max(self.config.prediction_horizons)
+    for horizon in targets:
+        targets[horizon] = targets[horizon][:-max_horizon]
+    
+    self.features = self.features.iloc[:-max_horizon].copy()
+    self.targets = targets
+    return targets
+```
+
+## 2. **Fix Feature Engineering - Add More Predictive Features**
+
+Your current features are basic. Add these proven predictive features:
+
+```python
+def engineer_features(self) -> pd.DataFrame:
+    """Engineer technical indicators and other features."""
+    print("Engineering features...")
+    
+    df = self.data.copy()
+    
+    # FIXED: Better price features
+    df['Returns'] = df['Close'].pct_change()
+    df['Log_Returns'] = np.log(df['Close'] / df['Close'].shift(1))
+    
+    # Volatility features (critical for crypto)
+    df['Volatility_5'] = df['Returns'].rolling(5).std()
+    df['Volatility_20'] = df['Returns'].rolling(20).std()
+    
+    # Volume-price features
+    df['VWAP'] = (df['Close'] * df['Volume']).rolling(20).sum() / df['Volume'].rolling(20).sum()
+    df['Volume_Price_Trend'] = df['Volume'] * df['Returns']
+    
+    # Momentum features
+    df['Momentum_5'] = df['Close'] / df['Close'].shift(5) - 1
+    df['Momentum_20'] = df['Close'] / df['Close'].shift(20) - 1
+    
+    # Order book proxy features
+    df['Spread_Proxy'] = (df['High'] - df['Low']) / df['Close']
+    df['Upper_Shadow'] = (df['High'] - df[['Open', 'Close']].max(axis=1)) / df['Close']
+    df['Lower_Shadow'] = (df[['Open', 'Close']].min(axis=1) - df['Low']) / df['Close']
+    
+    # Lagged features (very important for time series)
+    for lag in [1, 2, 3, 5]:
+        df[f'Returns_Lag_{lag}'] = df['Returns'].shift(lag)
+        df[f'Volume_Lag_{lag}'] = df['Volume'].shift(lag)
+    
+    # Rest of your existing features...
+    # [Keep your existing technical indicators]
+    
+    # CRITICAL: Remove any forward-looking bias
+    df = df.dropna().reset_index(drop=True)
+    
+    # Select only features that don't look into the future
+    feature_cols = [col for col in df.columns 
+                   if col not in [self.config.timestamp_col, self.config.target_col, 
+                                'Open', 'High', 'Low', 'Close', 'Volume']]  # Keep only derived features
+    
+    self.features = df[feature_cols].copy()
+    self.data = df
+    
+    return df
+```
+
+## 3. **Fix Model Architecture - Reduce Complexity**
+
+Your models are too complex for the amount of data. Simplify them:
+
+```python
+class SimpleLSTM(nn.Module):
+    """Simplified LSTM model to prevent overfitting."""
+    
+    def __init__(self, input_size: int, hidden_size: int = 32, output_size: int = 1):
+        super(SimpleLSTM, self).__init__()
+        self.hidden_size = hidden_size
+        
+        # Single LSTM layer with dropout
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=1, 
+                           batch_first=True, dropout=0.0)  # No dropout in single layer
+        
+        # Add batch normalization
+        self.bn = nn.BatchNorm1d(hidden_size)
+        self.dropout = nn.Dropout(0.3)
+        self.fc = nn.Linear(hidden_size, output_size)
+        
+    def forward(self, x):
+        batch_size = x.size(0)
+        h0 = torch.zeros(1, batch_size, self.hidden_size).to(x.device)
+        c0 = torch.zeros(1, batch_size, self.hidden_size).to(x.device)
+        
+        out, _ = self.lstm(x, (h0, c0))
+        out = out[:, -1, :]  # Take last output
+        
+        # Apply batch norm only if batch size > 1
+        if batch_size > 1:
+            out = self.bn(out)
+        
+        out = self.dropout(out)
+        out = self.fc(out)
+        return out
+```
+
+## 4. **Update Model Configuration**
+
+```python
+class ImprovedConfig(Config):
+    def __init__(self):
+        super().__init__()
+        # Shorter sequences (crypto moves fast)
+        self.sequence_length = 20
+        
+        # Smaller models to prevent overfitting
+        self.lstm_hidden_size = 32
+        self.lstm_num_layers = 1
+        
+        # Very short prediction horizons (more realistic)
+        self.prediction_horizons = [1, 2, 3]  # 1, 2, 3 minutes only
+        
+        # More conservative training
+        self.epochs = 100
+        self.batch_size = 64
+        self.learning_rate = 0.0005  # Lower learning rate
+        
+        # Better data splits (more validation data)
+        self.train_ratio = 0.6
+        self.val_ratio = 0.2
+        self.test_ratio = 0.2
+```
+
+## 5. **Fix Training Process**
+
+Add proper validation and early stopping:
+
+```python
+def train_pytorch_model(self, model, train_loader, val_loader, horizon: int, model_name: str):
+    """Improved training with better regularization."""
+    print(f"Training {model_name} for {horizon}-minute horizon...")
+    
+    model = model.to(self.config.device)
+    criterion = nn.SmoothL1Loss()  # More robust than MSE
+    optimizer = optim.Adam(model.parameters(), lr=self.config.learning_rate, weight_decay=1e-5)
+    
+    # Learning rate scheduler
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.7, patience=10, min_lr=1e-6
+    )
+    
+    best_val_loss = float('inf')
+    patience_counter = 0
+    train_losses = []
+    val_losses = []
+    
+    for epoch in range(self.config.epochs):
+        # Training phase
+        model.train()
+        train_loss = 0
+        for batch_X, batch_y in train_loader:
+            batch_X = batch_X.to(self.config.device)
+            batch_y = batch_y.to(self.config.device)
+            
+            optimizer.zero_grad()
+            outputs = model(batch_X)
+            loss = criterion(outputs.squeeze(), batch_y)
+            
+            # Add L1 regularization manually
+            l1_reg = sum(param.abs().sum() for param in model.parameters())
+            loss = loss + 1e-6 * l1_reg
+            
+            loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+            train_loss += loss.item()
+        
+        # Validation phase
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch_X, batch_y in val_loader:
+                batch_X = batch_X.to(self.config.device)
+                batch_y = batch_y.to(self.config.device)
+                outputs = model(batch_X)
+                val_loss += criterion(outputs.squeeze(), batch_y).item()
+        
+        train_loss /= len(train_loader)
+        val_loss /= len(val_loader)
+        
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        
+        scheduler.step(val_loss)
+        
+        # Early stopping and best model saving
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            torch.save(model.state_dict(), f'{model_name}_{horizon}min_best.pth')
+        else:
+            patience_counter += 1
+        
+        if epoch % 10 == 0:
+            print(f'Epoch {epoch}: Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}')
+        
+        # Early stopping
+        if patience_counter >= 20:
+            print("Early stopping triggered")
+            break
+        
+        # Stop if overfitting badly
+        if len(train_losses) > 20:
+            if val_losses[-1] > val_losses[-10] * 1.1:  # Val loss increased by 10%
+                print("Overfitting detected, stopping")
+                break
+    
+    # Load best model
+    model.load_state_dict(torch.load(f'{model_name}_{horizon}min_best.pth'))
+    return model
+```
+
+## 6. **Add Baseline Model for Comparison**
+
+```python
+def create_baseline_predictions(self, y_test, horizon):
+    """Create simple baseline predictions."""
+    # Random walk baseline (very hard to beat in financial data)
+    baseline_pred = np.zeros_like(y_test)  # Predict no change
+    
+    # Persistence model (last value)
+    # persistence_pred = np.full_like(y_test, y_test[0])
+    
+    return baseline_pred
+```
+
+## 7. **Most Important Changes to Make Right Now:**
+
+1. **Change your main execution to use the improved config:**
+
+```python
+# Replace your current execution with:
+system = CryptoPredictionSystem("./3_months_of_days_of_crypto_(1m).csv")
+system.config = ImprovedConfig()  # Use the improved config
+
+# Start with just LSTM
+system.config.models_to_train = {
+    'LSTM': True,
+    'CNN_LSTM': False,
+    'Transformer': False,
+    'LSTM_XGBoost': False,
+    'RL_Agent': False
+}
+
+results, output_dir = system.run_experiment("improved_experiment")
+```
+
+2. **Add this data quality check:**
+
+```python
+def check_data_quality(self):
+    """Check for data quality issues."""
+    print("Checking data quality...")
+    
+    # Check for duplicate timestamps
+    duplicates = self.data[self.config.timestamp_col].duplicated().sum()
+    print(f"Duplicate timestamps: {duplicates}")
+    
+    # Check for missing values
+    missing = self.data[self.config.required_cols].isnull().sum()
+    print(f"Missing values per column:\n{missing}")
+    
+    # Check for extreme outliers
+    price_changes = self.data['Close'].pct_change()
+    extreme_changes = (abs(price_changes) > 0.1).sum()  # >10% moves
+    print(f"Extreme price changes (>10%): {extreme_changes}")
+    
+    return duplicates == 0 and missing.sum() == 0
+```
+
+## Why Your Current Model Fails:
+
+1. **Predicting raw prices instead of returns** - Raw crypto prices have strong trends that models memorize instead of learning patterns
+2. **Too complex models** - Your models have too many parameters for the amount of signal in the data
+3. **Data leakage** - Using forward-looking information in features
+4. **Wrong prediction horizon** - 5-20 minutes is very difficult to predict in crypto
+5. **No baseline comparison** - You don't know if your models beat simple heuristics
+
+## Expected Results After Fixes:
+
+- **Before fixes**: Likely negative R² scores, huge prediction errors
+- **After fixes**: Should achieve R² > 0.01 (which is actually good for 1-minute crypto prediction)
+- **Baseline comparison**: Your models should at least beat a "no change" prediction
+
+Start with these fixes, especially changing to percentage returns and using the simplified model architecture. The difference should be dramatic.
